@@ -1,0 +1,8 @@
+node_modules
+.next
+.env
+*.log
+uploads
+*.mp3
+*.wav
+*.m4a
