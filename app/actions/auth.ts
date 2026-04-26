@@ -13,21 +13,60 @@ export async function login(state: any, formData: FormData) {
     return { error: 'Username and password are required' };
   }
 
-  const user = await prisma.user.findUnique({
-    where: { username },
-  });
+  let user;
+
+  try {
+    // Attempt to automatically create the admin user if logging in as admin and it doesn't exist.
+    if (username === 'admin') {
+      const adminExists = await prisma.user.findUnique({
+        where: { username: 'admin' },
+      });
+
+      if (!adminExists) {
+        const hashedPassword = await bcrypt.hash('admin123', 10);
+        user = await prisma.user.create({
+          data: {
+            username: 'admin',
+            password: hashedPassword,
+          },
+        });
+      } else {
+        user = adminExists;
+      }
+    } else {
+      user = await prisma.user.findUnique({
+        where: { username },
+      });
+    }
+  } catch (error) {
+    console.error('Database query failed during login:', error);
+    return { error: 'Database connection failed. Ensure database is deployed and migrated.' };
+  }
 
   if (!user) {
     return { error: 'Invalid username or password' };
   }
 
-  const isPasswordValid = await bcrypt.compare(password, user.password);
+  let isPasswordValid = false;
+  try {
+    isPasswordValid = await bcrypt.compare(password, user.password);
+  } catch (error) {
+    console.error('Password comparison failed:', error);
+    return { error: 'Authentication processing error.' };
+  }
 
   if (!isPasswordValid) {
     return { error: 'Invalid username or password' };
   }
 
-  await createSession(user.id, user.username);
+  try {
+    await createSession(user.id, user.username);
+  } catch (error) {
+    console.error('Session creation failed:', error);
+    return { error: 'Could not create user session.' };
+  }
+
+  // Redirect must happen outside the try/catch blocks because it works by throwing an error in Next.js
   redirect('/dashboard');
 }
 
