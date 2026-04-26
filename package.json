@@ -10,7 +10,7 @@
     "build": "prisma generate && prisma db push && next build",
     "start": "next start",
     "lint": "next lint",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate || true"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
