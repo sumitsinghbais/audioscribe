@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 type Transcript = {
   id: string;
@@ -12,7 +12,7 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
   // Transcripts State
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [isFetchingHistory, setIsFetchingHistory] = useState(true);
-  
+
   // Uploader State
   const [file, setFile] = useState<File | null>(null);
   const [audioDuration, setAudioDuration] = useState<string | null>(null);
@@ -20,17 +20,23 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Drag & Drop State
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounter = useRef(0);
+
   // Copy-to-clipboard State
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  // Delete State
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // ─── Data Fetching ──────────────────────────────────────────
   const fetchTranscripts = async () => {
     try {
       const res = await fetch('/api/transcripts');
       const data = await res.json();
       if (data.success) {
         setTranscripts(data.transcripts);
-      } else {
-        console.error(data.error);
       }
     } catch (e) {
       console.error(e);
@@ -43,21 +49,47 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
     fetchTranscripts();
   }, []);
 
+  // ─── Copy ───────────────────────────────────────────────────
   const handleCopy = async (id: string, text: string) => {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
-      console.error('Failed to copy text: ', err);
+      console.error('Failed to copy:', err);
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // ─── Delete ─────────────────────────────────────────────────
+  const handleDelete = async (id: string) => {
+    const confirmed = window.confirm('Delete this transcript permanently?');
+    if (!confirmed) return;
+
+    // Optimistic UI update
+    setDeletingId(id);
+    const previousTranscripts = [...transcripts];
+    setTranscripts((prev) => prev.filter((t) => t.id !== id));
+
+    try {
+      const res = await fetch(`/api/transcripts/${id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!data.success) {
+        // Rollback on failure
+        setTranscripts(previousTranscripts);
+        setError(data.error || 'Failed to delete transcript.');
+      }
+    } catch {
+      setTranscripts(previousTranscripts);
+      setError('Network error while deleting transcript.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  // ─── File Validation (shared between click & drop) ──────────
+  const validateAndSetFile = useCallback((selectedFile: File) => {
     setError('');
     setAudioDuration(null);
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
 
     if (!selectedFile.type.startsWith('audio/')) {
       setError('Please select a valid audio file (mp3, wav, m4a, etc).');
@@ -85,11 +117,55 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
       URL.revokeObjectURL(audio.src);
     };
     audio.onerror = () => {
-       setError('Failed to load audio file duration.');
-       setFile(null);
-    }
+      setError('Failed to load audio file.');
+      setFile(null);
+    };
+  }, []);
+
+  // ─── Click Upload Handler ───────────────────────────────────
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
+    validateAndSetFile(selectedFile);
   };
 
+  // ─── Drag & Drop Handlers ──────────────────────────────────
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current++;
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      setIsDragging(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current--;
+    if (dragCounter.current === 0) {
+      setIsDragging(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    dragCounter.current = 0;
+
+    const droppedFile = e.dataTransfer.files?.[0];
+    if (droppedFile) {
+      validateAndSetFile(droppedFile);
+    }
+  }, [validateAndSetFile]);
+
+  // ─── Upload ─────────────────────────────────────────────────
   const handleUpload = async () => {
     if (!file) return;
     setIsUploading(true);
@@ -113,15 +189,16 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
       setFile(null);
       setAudioDuration(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
-      
+
       await fetchTranscripts();
     } catch (err: any) {
-       setError(err.message || 'An error occurred during upload.');
+      setError(err.message || 'An error occurred during upload.');
     } finally {
-       setIsUploading(false);
+      setIsUploading(false);
     }
   };
 
+  // ─── Render ─────────────────────────────────────────────────
   return (
     <div className="max-w-7xl mx-auto py-10 px-4 sm:px-6 lg:px-8 w-full flex-1">
       <header className="mb-8">
@@ -132,36 +209,64 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
           Upload audio to generate transcripts.
         </p>
       </header>
-      
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Upload Section */}
+        {/* ── Upload Section ── */}
         <div className="lg:col-span-1">
           <div className="bg-white dark:bg-gray-900 shadow rounded-xl border border-gray-100 dark:border-gray-800 p-6">
             <h2 className="text-xl font-semibold mb-4 text-gray-900 dark:text-white">Upload Audio</h2>
-            
+
             <div className="space-y-4">
-              <div className="flex items-center justify-center w-full">
-                <label htmlFor="dropzone-file" className="flex flex-col items-center justify-center w-full h-40 border-2 border-gray-300 dark:border-gray-700 border-dashed rounded-lg cursor-pointer bg-gray-50 dark:bg-gray-800/50 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+              {/* Drag & Drop Zone */}
+              <div
+                className="flex items-center justify-center w-full"
+                onDragEnter={handleDragEnter}
+                onDragLeave={handleDragLeave}
+                onDragOver={handleDragOver}
+                onDrop={handleDrop}
+              >
+                <label
+                  htmlFor="dropzone-file"
+                  className={`flex flex-col items-center justify-center w-full h-40 border-2 border-dashed rounded-lg cursor-pointer transition-all duration-200 ${
+                    isDragging
+                      ? 'border-primary bg-primary/5 dark:bg-primary/10 scale-[1.02]'
+                      : 'border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }`}
+                >
                   <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                    <svg className="w-8 h-8 mb-4 text-gray-500 dark:text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
-                      <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
-                    </svg>
-                    <p className="mb-2 text-sm text-gray-500 dark:text-gray-400"><span className="font-semibold">Click to upload</span></p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Max 5MB (Audio only)</p>
+                    {isDragging ? (
+                      <>
+                        <svg className="w-8 h-8 mb-4 text-primary animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+                        </svg>
+                        <p className="mb-2 text-sm text-primary font-semibold">Drop your audio here</p>
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-8 h-8 mb-4 text-gray-500 dark:text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
+                          <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
+                        </svg>
+                        <p className="mb-2 text-sm text-gray-500 dark:text-gray-400">
+                          <span className="font-semibold">Click to upload</span> or drag & drop
+                        </p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Audio only · Max 5MB · Under 1 min</p>
+                      </>
+                    )}
                   </div>
                   <input id="dropzone-file" type="file" accept="audio/*" className="hidden" onChange={handleFileChange} ref={fileInputRef} disabled={isUploading} />
                 </label>
               </div>
 
+              {/* Selected File Info */}
               {file && !error && (
-                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 animate-in fade-in duration-200">
                   <div className="flex items-center space-x-3 overflow-hidden">
                     <div className="p-2 bg-primary/10 rounded-full flex-shrink-0">
                       <svg className="w-4 h-4 text-primary" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM14.657 2.929a1 1 0 011.414 0A9.972 9.972 0 0119 10a9.972 9.972 0 01-2.929 7.071 1 1 0 01-1.414-1.414A7.971 7.971 0 0017 10c0-2.21-.894-4.208-2.343-5.657a1 1 0 010-1.414zm-2.829 2.828a1 1 0 011.415 0A5.983 5.983 0 0115 10a5.984 5.984 0 01-1.757 4.243 1 1 0 01-1.415-1.415A3.984 3.984 0 0013 10a3.983 3.983 0 00-1.172-2.828 1 1 0 010-1.415z" clipRule="evenodd" /></svg>
                     </div>
                     <div className="flex flex-col min-w-0">
                       <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate block">{file.name}</span>
-                      <span className="text-xs text-gray-500 dark:text-gray-400">{(file.size / 1024 / 1024).toFixed(2)} MB {audioDuration ? `• ${audioDuration}` : ''}</span>
+                      <span className="text-xs text-gray-500 dark:text-gray-400">{(file.size / 1024 / 1024).toFixed(2)} MB {audioDuration ? `· ${audioDuration}` : ''}</span>
                     </div>
                   </div>
                   <button onClick={() => { setFile(null); setAudioDuration(null); if (fileInputRef.current) fileInputRef.current.value = ''; }} className="p-1.5 text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 hover:text-red-500 rounded-md transition-colors flex-shrink-0 ml-2" disabled={isUploading}>
@@ -170,13 +275,15 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
                 </div>
               )}
 
+              {/* Error Display */}
               {error && (
                 <div className="p-3 text-sm text-red-600 bg-red-50 dark:bg-red-900/20 dark:text-red-400 rounded-md border border-red-200 dark:border-red-800 flex items-center space-x-2">
-                   <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                  <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                   <span>{error}</span>
                 </div>
               )}
 
+              {/* Upload Button */}
               <button onClick={handleUpload} disabled={!file || isUploading} className="w-full flex justify-center items-center py-2.5 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary hover:bg-[#4338CA] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-60 disabled:cursor-not-allowed transition-colors">
                 {isUploading ? (
                   <><svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Transcribing...</>
@@ -185,8 +292,8 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
             </div>
           </div>
         </div>
-        
-        {/* Transcripts Section */}
+
+        {/* ── Transcripts Section ── */}
         <div className="lg:col-span-2">
           <div className="bg-white dark:bg-gray-900 shadow rounded-xl border border-gray-100 dark:border-gray-800 h-full flex flex-col">
             <div className="px-6 py-5 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center">
@@ -195,8 +302,9 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
                 <span className="bg-primary/10 text-primary text-xs font-medium px-2.5 py-0.5 rounded-full">{transcripts.length} total</span>
               )}
             </div>
-            
+
             <div className="px-6 py-5 flex-1 overflow-y-auto min-h-[300px]">
+              {/* Loading Skeleton */}
               {isFetchingHistory ? (
                 <div className="space-y-4 animate-pulse">
                   {[1, 2, 3].map((i) => (
@@ -210,6 +318,8 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
                     </div>
                   ))}
                 </div>
+
+              /* Empty State */
               ) : transcripts.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full py-10 text-center">
                   <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-full mb-4">
@@ -218,23 +328,34 @@ export default function DashboardClient({ initialUsername }: { initialUsername: 
                   <h3 className="text-sm font-medium text-gray-900 dark:text-white">No transcripts yet</h3>
                   <p className="mt-1 text-sm text-gray-500 dark:text-gray-400 max-w-[250px]">Upload an audio file on the left to start generating transcripts.</p>
                 </div>
+
+              /* Transcript List */
               ) : (
                 <ul className="space-y-4">
                   {transcripts.map((t) => (
                     <li key={t.id} className="bg-white dark:bg-gray-800 shadow-sm rounded-lg p-5 border border-gray-100 dark:border-gray-700 hover:shadow-md transition-shadow relative group">
-                      <p className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed pr-8 whitespace-pre-wrap">{t.content}</p>
-                      <button onClick={() => handleCopy(t.id, t.content)} className="absolute top-4 right-4 p-1.5 text-gray-400 hover:text-primary hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md transition-all opacity-0 group-hover:opacity-100 focus:opacity-100" title="Copy to clipboard">
-                        {copiedId === t.id ? (
-                          <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
-                        ) : (
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                        )}
-                      </button>
-                      <div className="mt-4 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 border-t border-gray-50 dark:border-gray-700/50 pt-3">
-                        <span className="flex items-center space-x-1">
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                          <span>{new Date(t.createdAt).toLocaleString()}</span>
-                        </span>
+                      <p className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed pr-16 whitespace-pre-wrap">{t.content}</p>
+
+                      {/* Action Buttons (top-right) */}
+                      <div className="absolute top-4 right-4 flex items-center space-x-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                        {/* Copy */}
+                        <button onClick={() => handleCopy(t.id, t.content)} className="p-1.5 text-gray-400 hover:text-primary hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md transition-all" title="Copy to clipboard">
+                          {copiedId === t.id ? (
+                            <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
+                          ) : (
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                          )}
+                        </button>
+                        {/* Delete */}
+                        <button onClick={() => handleDelete(t.id)} disabled={deletingId === t.id} className="p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-md transition-all disabled:opacity-50" title="Delete transcript">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                        </button>
+                      </div>
+
+                      {/* Footer */}
+                      <div className="mt-4 flex items-center text-xs text-gray-500 dark:text-gray-400 border-t border-gray-50 dark:border-gray-700/50 pt-3">
+                        <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        <span>{new Date(t.createdAt).toLocaleString()}</span>
                       </div>
                     </li>
                   ))}
