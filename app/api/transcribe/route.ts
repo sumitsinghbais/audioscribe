@@ -1,128 +1,130 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { verifySession } from '@/lib/session';
 import prisma from '@/lib/db';
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB limit
-
-// In-memory rate limiting map
-const rateLimitMap = new Map<string, { count: number, resetTime: number }>();
-
-function isRateLimited(userId: string): boolean {
-  const now = Date.now();
-  const windowMs = 60 * 1000; // 1 minute window
-  const maxRequests = 5;
-
-  const data = rateLimitMap.get(userId);
-  if (!data || now > data.resetTime) {
-    rateLimitMap.set(userId, { count: 1, resetTime: now + windowMs });
-    return false;
-  }
-
-  if (data.count >= maxRequests) {
-    return true;
-  }
-
-  data.count += 1;
-  return false;
-}
 
 export async function POST(req: NextRequest) {
   try {
     // 1. Authentication Guard
     const session = await verifySession();
     if (!session?.userId) {
-      return NextResponse.json({ success: false, error: 'Unauthorized: Valid session required.' }, { status: 401 });
+      return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
     }
 
-    // 2. Rate Limiting Check
-    if (isRateLimited(session.userId)) {
-      return NextResponse.json({ success: false, error: 'Rate limit exceeded. Maximum 5 requests per minute allowed.' }, { status: 429 });
+    // 2. Env check
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error("🔥 GEMINI_API_KEY is missing in environment variables");
+      return NextResponse.json(
+        { success: false, error: 'Server misconfiguration: API key missing' },
+        { status: 500 }
+      );
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return NextResponse.json({ success: false, error: 'Server misconfiguration: GEMINI_API_KEY is missing.' }, { status: 500 });
-    }
-
+    // 3. Parse and Validate File
     const formData = await req.formData();
     const file = formData.get('audio') as File | null;
 
     if (!file) {
-      return NextResponse.json({ success: false, error: 'No audio file provided in the request payload.' }, { status: 400 });
+      return NextResponse.json({ success: false, error: 'No audio file provided' }, { status: 400 });
     }
 
-    // 3. Strict Server-side Validation
+    // Strict validation
     if (!file.type.startsWith('audio/')) {
-      return NextResponse.json({ success: false, error: 'Invalid file format. Only audio MIME types are supported.' }, { status: 400 });
+      return NextResponse.json({ success: false, error: 'Invalid file type. Must be audio.' }, { status: 400 });
     }
 
-    if (file.size > MAX_FILE_SIZE) {
-      return NextResponse.json({ success: false, error: 'Audio file size exceeds the 5MB maximum limit.' }, { status: 400 });
+    if (file.size > 5 * 1024 * 1024) {
+      return NextResponse.json({ success: false, error: 'File too large. Max 5MB allowed.' }, { status: 400 });
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const base64Data = Buffer.from(arrayBuffer).toString('base64');
-    const mimeType = file.type;
+    // 4. Convert Audio to Base64
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const base64Audio = buffer.toString("base64");
 
-    // 4. Gemini Transcription with Timeout
-    let transcriptText = '';
+    // 5. Direct REST API Call to Gemini (v1beta with EXACT required structure)
+    let transcript = "";
     try {
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-      const prompt = 'Please carefully transcribe this audio. Return ONLY the exact transcription text, with no introductory or conversational text. If there is no speech, return an empty string.';
-      
-      const generationPromise = model.generateContent([
-        prompt,
-        {
-          inlineData: { mimeType, data: base64Data },
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+      const response = await fetch(geminiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      ]);
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('TIMEOUT')), 10000); // 10 second timeout
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: "Transcribe this audio clearly. Return ONLY the exact transcription text."
+                },
+                {
+                  inlineData: {
+                    mimeType: file.type || "audio/mpeg",
+                    data: base64Audio
+                  }
+                }
+              ]
+            }
+          ]
+        }),
       });
 
-      const result: any = await Promise.race([generationPromise, timeoutPromise]);
-      transcriptText = result.response.text();
-    } catch (geminiError: any) {
-      console.error('Gemini Failure Log:', geminiError.stack || geminiError);
-      
-      let errorMessage = 'AI Processing Error: Failed to generate transcript.';
-      if (geminiError.message === 'TIMEOUT') {
-        errorMessage = 'Transcription timed out (10s limit exceeded). Please try a shorter audio file.';
-      } else if (geminiError?.message?.includes('API_KEY_INVALID')) {
-        errorMessage = 'Invalid Gemini API Key configuration.';
+      const rawText = await response.text();
+
+      if (!response.ok) {
+        console.error("🔥 GEMINI ERROR FULL:", rawText);
+
+        return NextResponse.json(
+          { success: false, error: rawText },
+          { status: 502 }
+        );
       }
-      
-      return NextResponse.json({ success: false, error: errorMessage }, { status: 502 });
+
+      const data = JSON.parse(rawText);
+      transcript = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    } catch (restError: any) {
+      console.error("🔥 GEMINI FETCH FATAL ERROR:", restError);
+      return NextResponse.json(
+        { success: false, error: restError.message || "Failed to reach Gemini API" },
+        { status: 502 }
+      );
     }
 
-    // 5. Strong Transcript Validation
-    const finalizedText = transcriptText.trim();
-    if (!finalizedText || finalizedText.length < 3) {
-       return NextResponse.json({ success: false, error: 'Transcription rejected: Audio contained no meaningful speech or was too quiet.' }, { status: 422 });
+    // 6. Validate Response safely
+    if (!transcript || transcript.trim().length < 3) {
+      return NextResponse.json(
+        { success: false, error: 'No speech detected' },
+        { status: 422 }
+      );
     }
 
-    // 6. DB Storage
+    // 7. Save to Database
     try {
       await prisma.transcript.create({
         data: {
-          content: finalizedText,
+          content: transcript.trim(),
           userId: session.userId,
         }
       });
-    } catch (dbError: any) {
-      console.error('Database Failure Log:', dbError.stack || dbError);
-      return NextResponse.json({ success: false, error: 'Transcription was generated but failed to persist to the database.' }, { status: 500 });
+    } catch (dbError) {
+      console.error("🔥 DB SAVE ERROR:", dbError);
+      return NextResponse.json(
+        { success: false, error: 'Transcription succeeded but failed to save to database.' },
+        { status: 500 }
+      );
     }
 
-    return NextResponse.json({ success: true, transcript: finalizedText });
-    
+    return NextResponse.json({
+      success: true,
+      transcript: transcript.trim()
+    });
+
   } catch (error: any) {
-    // 7. Ultimate Crash Prevention
-    console.error('Unhandled Transcription Route Fatal Error:', error.stack || error);
+    console.error("🔥 TOP LEVEL ERROR IN TRANSCRIBE ROUTE:", error);
     return NextResponse.json(
-      { success: false, error: 'An unexpected internal server error crashed the process.' },
+      { success: false, error: error.message || "Internal server error" },
       { status: 500 }
     );
   }
